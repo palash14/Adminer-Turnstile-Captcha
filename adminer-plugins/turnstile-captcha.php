@@ -40,6 +40,24 @@ class AdminerTurnstileCaptcha {
     public function __construct($siteKey, $secretKey) {
         $this->siteKey   = $siteKey;
         $this->secretKey = $secretKey;
+
+        // Validate the token during the login POST and store the result in the
+        // session here in the constructor — same pattern as AdminerLoginOtp.
+        // session_regenerate_id() preserves existing session data, so values
+        // written here survive into the session that login() reads later.
+        if (!empty($_POST['auth'])) {
+            $token = isset($_POST['cf-turnstile-response']) ? trim($_POST['cf-turnstile-response']) : '';
+
+            if ($token !== '' && $this->verifyToken($token)) {
+                $_SESSION['turnstile_passed'] = true;
+                $_SESSION['turnstile_error']  = null;
+            } else {
+                $_SESSION['turnstile_passed'] = false;
+                $_SESSION['turnstile_error']  = ($token === '')
+                    ? 'Please complete the CAPTCHA before logging in.'
+                    : 'CAPTCHA verification failed. Please try again.';
+            }
+        }
     }
 
     /**
@@ -65,75 +83,25 @@ class AdminerTurnstileCaptcha {
     }
 
     /**
-     * On login POST: validate the Turnstile token and store the result in a
-     * short-lived signed cookie so it survives Adminer's session_regenerate_id()
-     * call (which destroys session data written before it runs).
-     *
-     * Adminer's auth flow:
-     *   POST /adminer.php  →  headers() [we validate here]
-     *                      →  session_regenerate_id()  ← destroys session data
-     *                      →  302 redirect to /adminer.php?server=...
-     *   GET  /adminer.php?server=...  →  login() [we check here]
-     */
-    public function headers() {
-        if ($_SERVER['REQUEST_METHOD'] !== 'POST' || empty($_POST['auth'])) {
-            return;
-        }
-
-        $token = isset($_POST['cf-turnstile-response']) ? trim($_POST['cf-turnstile-response']) : '';
-
-        if ($token !== '' && $this->verifyToken($token)) {
-            // Sign the pass with a one-time value tied to the current session ID
-            // so it cannot be forged or replayed across sessions
-            $pass = hash_hmac('sha256', session_id() . '|pass', $this->secretKey);
-            setcookie('_turnstile_ok', $pass, [
-                'expires'  => time() + 60,
-                'path'     => $this->cookiePath(),
-                'httponly' => true,
-                'samesite' => 'Strict',
-            ]);
-            setcookie('_turnstile_err', '', ['expires' => time() - 3600, 'path' => $this->cookiePath(), 'httponly' => true, 'samesite' => 'Strict']);
-        } else {
-            $msg = ($token === '')
-                ? 'Please complete the CAPTCHA before logging in.'
-                : 'CAPTCHA verification failed. Please try again.';
-            setcookie('_turnstile_err', $msg, [
-                'expires'  => time() + 60,
-                'path'     => $this->cookiePath(),
-                'httponly' => true,
-                'samesite' => 'Strict',
-            ]);
-            setcookie('_turnstile_ok', '', ['expires' => time() - 3600, 'path' => $this->cookiePath(), 'httponly' => true, 'samesite' => 'Strict']);
-        }
-    }
-
-    /**
      * Block login if the CAPTCHA was not solved.
-     * Checks the signed cookie set in headers() — survives session_regenerate_id().
+     * Reads the flag stored in the constructor — same request lifecycle as
+     * AdminerLoginOtp's OTP check.
      *
      * @param string $login    Submitted username
      * @param string $password Submitted password
-     * @return bool|null true = allow, false = block, null = defer to Adminer
+     * @return bool|null null = allow, false/string = block
      */
     public function login($login, $password) {
-        $cookie = isset($_COOKIE['_turnstile_ok']) ? $_COOKIE['_turnstile_ok'] : '';
+        if (isset($_SESSION['turnstile_passed'])) {
+            $passed = $_SESSION['turnstile_passed'];
+            unset($_SESSION['turnstile_passed']);
 
-        if ($cookie === '') {
-            return false;
+            if (!$passed) {
+                return false;
+            }
         }
 
-        // Verify the HMAC — session ID is now the *new* one after regeneration,
-        // so we accept either old or new by just checking the cookie exists and
-        // is a valid hex string (full HMAC verification would need the old session ID).
-        // Instead we use a server-side secret so the cookie cannot be forged.
-        if (!preg_match('/^[0-9a-f]{64}$/', $cookie)) {
-            return false;
-        }
-
-        // Consume the cookie so it cannot be reused
-        setcookie('_turnstile_ok', '', ['expires' => time() - 3600, 'path' => $this->cookiePath(), 'httponly' => true, 'samesite' => 'Strict']);
-
-        return null; // let Adminer verify the DB credentials
+        return null;
     }
 
     /**
@@ -151,19 +119,18 @@ class AdminerTurnstileCaptcha {
         // Prepend any CAPTCHA error above the first field
         if ($name === 'driver') {
             $error = '';
-            if (!empty($_COOKIE['_turnstile_err'])) {
+            if (!empty($_SESSION['turnstile_error'])) {
                 $error = '<tr><td colspan="2"><div class="error" style="margin-bottom:0.5em;">'
-                       . htmlspecialchars($_COOKIE['_turnstile_err'], ENT_QUOTES, 'UTF-8')
+                       . htmlspecialchars($_SESSION['turnstile_error'], ENT_QUOTES, 'UTF-8')
                        . '</div></td></tr>' . "\n";
-                // Clear the error cookie
-                setcookie('_turnstile_err', '', ['expires' => time() - 3600, 'path' => $this->cookiePath(), 'httponly' => true, 'samesite' => 'Strict']);
+                unset($_SESSION['turnstile_error']);
             }
             return $error . $label . $input . "\n";
         }
 
         // After the last field (db), close the table, render the widget, reopen table.
         // Scripts cannot be direct children of <table>, so we break out of it.
-        // script_src() is used so the tag carries Adminer's CSP nonce.
+        // script_src() carries Adminer's CSP nonce so the script is allowed.
         if ($name === 'db') {
             $widget  = $label . $input . "\n";
             $widget .= '</table>' . "\n";
@@ -176,13 +143,9 @@ class AdminerTurnstileCaptcha {
         return null;
     }
 
-    /**
-     * Cookie path helper — use the directory so the cookie is sent on all
-     * requests under the same folder (POST + redirected GET both match).
-     */
-    private function cookiePath() {
-        return rtrim(dirname($_SERVER['REQUEST_URI']), '/') . '/';
-    }
+    // -------------------------------------------------------------------------
+    // Private helpers
+    // -------------------------------------------------------------------------
 
     /**
      * Call the Turnstile siteverify API and return whether the token is valid.
